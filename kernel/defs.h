@@ -62,6 +62,7 @@ void            ramdiskrw(struct buf*);
 // kalloc.c
 void*           kalloc(void);
 void            kfree(void *);
+uint64          freemem(void);
 void            kinit(void);
 
 // log.c
@@ -185,3 +186,4 @@ void            virtio_disk_intr(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+uint64          nproc(void);

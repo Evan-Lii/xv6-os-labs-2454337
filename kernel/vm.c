@@ -472,3 +472,54 @@ vmprint(pagetable_t pagetable)
   printf("page table %p\n", pagetable);
   vmprintwalk(pagetable, 0);
 }
+
+
+static pagetable_t
+kvmpagetablecopy(pagetable_t old)
+{
+  pagetable_t new;
+  pte_t pte;
+
+  new = (pagetable_t)kalloc();
+  if(new == 0)
+    panic("kvmpagetablecopy");
+  memset(new, 0, PGSIZE);
+
+  for(int i = 0; i < 512; i++){
+    pte = old[i];
+    if(pte & PTE_V){
+      if((pte & (PTE_R | PTE_W | PTE_X)) == 0){
+        pagetable_t child = kvmpagetablecopy((pagetable_t)PTE2PA(pte));
+        new[i] = PA2PTE(child) | PTE_FLAGS(pte);
+      } else {
+        new[i] = pte;
+      }
+    }
+  }
+
+  return new;
+}
+
+pagetable_t
+kvmpagetable(void)
+{
+  return kvmpagetablecopy(kernel_pagetable);
+}
+
+void
+kfreewalk(pagetable_t pagetable)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+
+    if((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0){
+      uint64 child = PTE2PA(pte);
+      kfreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if(pte & PTE_V){
+      pagetable[i] = 0;
+    }
+  }
+
+  kfree((void*)pagetable);
+}

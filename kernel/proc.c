@@ -121,6 +121,13 @@ found:
     return 0;
   }
 
+  p->kpagetable = kvmpagetable();
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -142,6 +149,10 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+
+  if(p->kpagetable)
+    kfreewalk(p->kpagetable);
+  p->kpagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -473,7 +484,13 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

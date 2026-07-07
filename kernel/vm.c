@@ -379,24 +379,31 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
+  uint64 n;
+  uint64 va0;
+  uint64 orig_srcva = srcva;
+  uint64 orig_len = len;
+
+  if(srcva + len < srcva)
+    return -1;
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
+    if(walkaddr(pagetable, va0) == 0)
       return -1;
+
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
     len -= n;
-    dst += n;
     srcva = va0 + PGSIZE;
   }
-  return 0;
+
+  return copyin_new(pagetable, dst, orig_srcva, orig_len);
 }
+
+
 
 // Copy a null-terminated string from user to kernel.
 // Copy bytes to dst from virtual address srcva in a given page table,
@@ -405,7 +412,11 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
+  uint64 n;
+  uint64 va0;
+  uint64 pa0;
+  uint64 orig_srcva = srcva;
+  uint64 orig_max = max;
   int got_null = 0;
 
   while(got_null == 0 && max > 0){
@@ -413,33 +424,38 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
+
     n = PGSIZE - (srcva - va0);
     if(n > max)
       n = max;
 
-    char *p = (char *) (pa0 + (srcva - va0));
+    char *p = (char *)(pa0 + (srcva - va0));
+
     while(n > 0){
       if(*p == '\0'){
-        *dst = '\0';
         got_null = 1;
         break;
-      } else {
-        *dst = *p;
       }
-      --n;
-      --max;
+
+      n--;
+      max--;
       p++;
-      dst++;
+      srcva++;
     }
+
+    if(got_null)
+      break;
 
     srcva = va0 + PGSIZE;
   }
-  if(got_null){
-    return 0;
-  } else {
+
+  if(got_null == 0)
     return -1;
-  }
+
+  return copyinstr_new(pagetable, dst, orig_srcva, orig_max);
 }
+
+
 
 
 static void
@@ -522,4 +538,60 @@ kfreewalk(pagetable_t pagetable)
   }
 
   kfree((void*)pagetable);
+}
+
+
+int
+uvm2kvm(pagetable_t upagetable, pagetable_t kpagetable, uint64 oldsz, uint64 newsz)
+{
+  pte_t *upte;
+  pte_t *kpte;
+  uint64 pa;
+  uint64 flags;
+
+  if(newsz >= PLIC)
+    return -1;
+
+  oldsz = PGROUNDUP(oldsz);
+
+  for(uint64 a = oldsz; a < newsz; a += PGSIZE){
+    upte = walk(upagetable, a, 0);
+    if(upte == 0)
+      continue;
+    if((*upte & PTE_V) == 0)
+      continue;
+    if((*upte & PTE_U) == 0)
+      continue;
+
+    pa = PTE2PA(*upte);
+    flags = PTE_FLAGS(*upte);
+    flags &= ~PTE_U;
+
+    kpte = walk(kpagetable, a, 1);
+    if(kpte == 0)
+      return -1;
+
+    *kpte = PA2PTE(pa) | flags;
+  }
+
+  return 0;
+}
+
+
+void
+uvmunmapk(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if(newsz >= oldsz)
+    return;
+
+  a = PGROUNDUP(newsz);
+  for(; a < PGROUNDUP(oldsz); a += PGSIZE){
+    pte = walk(pagetable, a, 0);
+    if(pte && (*pte & PTE_V)){
+      *pte = 0;
+    }
+  }
 }

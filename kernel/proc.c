@@ -232,6 +232,9 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  if(uvm2kvm(p->pagetable, p->kpagetable, 0, p->sz) < 0)
+    panic("userinit: uvm2kvm");
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -249,20 +252,34 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint64 sz;
+  uint64 oldsz;
   struct proc *p = myproc();
 
   sz = p->sz;
+  oldsz = sz;
+
   if(n > 0){
+    if(sz + n >= PLIC)
+      return -1;
+
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+      return -1;
+    }
+
+    if(uvm2kvm(p->pagetable, p->kpagetable, oldsz, sz) < 0){
+      uvmdealloc(p->pagetable, sz, oldsz);
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uvmunmapk(p->kpagetable, oldsz, sz);
   }
+
   p->sz = sz;
   return 0;
 }
+
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
@@ -280,6 +297,12 @@ fork(void)
 
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
+  if(uvm2kvm(np->pagetable, np->kpagetable, 0, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;

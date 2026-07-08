@@ -299,6 +299,53 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   freewalk(pagetable);
 }
 
+
+// Handle a copy-on-write page fault.
+// Allocate a private writable copy for virtual address va.
+int
+cowalloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  va = PGROUNDDOWN(va);
+
+  if(va >= MAXVA)
+    return -1;
+
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_V) == 0)
+    return -1;
+  if((*pte & PTE_U) == 0)
+    return -1;
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  memmove(mem, (char*)pa, PGSIZE);
+
+  flags = (flags | PTE_W) & ~PTE_COW;
+
+  uvmunmap(pagetable, va, 1, 1);
+
+  if(mappages(pagetable, va, PGSIZE, (uint64)mem, flags) != 0){
+    kfree(mem);
+    return -1;
+  }
+
+  return 0;
+}
+
 // Given a parent process's page table, copy
 // its memory into a child's page table.
 // Copies both the page table and the
@@ -311,28 +358,37 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  int changed = 0;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
-    }
-  }
-  return 0;
 
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
-  return -1;
+    // If the page was writable, mark it as copy-on-write
+    // and remove write permission in both parent and child.
+    if(flags & PTE_W){
+      flags = (flags | PTE_COW) & ~PTE_W;
+      *pte = PA2PTE(pa) | flags;
+      changed = 1;
+    }
+
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      uvmunmap(new, 0, i / PGSIZE, 1);
+      return -1;
+    }
+
+    kaddref((void*)pa);
+  }
+
+  if(changed)
+    sfence_vma();
+
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -355,9 +411,21 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if(va0 >= MAXVA)
+      return -1;
+
+    pte = walk(pagetable, va0, 0);
+    if(pte == 0)
+      return -1;
+    if((*pte & PTE_COW) != 0){
+      if(cowalloc(pagetable, va0) < 0)
+        return -1;
+    }
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;

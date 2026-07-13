@@ -19,6 +19,9 @@ static struct mbuf *rx_mbufs[RX_RING_SIZE];
 // remember where the e1000's registers live.
 static volatile uint32 *regs;
 
+static struct spinlock tx_lock;
+static struct spinlock rx_lock;
+
 struct spinlock e1000_lock;
 
 // called by pci_init().
@@ -32,6 +35,9 @@ e1000_init(uint32 *xregs)
   initlock(&e1000_lock, "e1000");
 
   regs = xregs;
+
+  initlock(&tx_lock, "e1000_tx");
+  initlock(&rx_lock, "e1000_rx");
 
   // Reset the device
   regs[E1000_IMS] = 0; // disable interrupts
@@ -95,27 +101,70 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(struct mbuf *m)
 {
-  //
-  // Your code here.
-  //
-  // the mbuf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after sending.
-  //
-  
+  acquire(&tx_lock);
+
+  uint32 idx = regs[E1000_TDT];
+
+  // 如果 DD 位没有置位，说明这个描述符还没发送完，不能覆盖。
+  if((tx_ring[idx].status & E1000_TXD_STAT_DD) == 0){
+    release(&tx_lock);
+    return -1;
+  }
+
+  // 之前挂在这个描述符上的 mbuf 已经发送完成，可以释放。
+  if(tx_mbufs[idx])
+    mbuffree(tx_mbufs[idx]);
+
+  tx_ring[idx].addr = (uint64)m->head;
+  tx_ring[idx].length = m->len;
+  tx_ring[idx].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_ring[idx].status = 0;
+  tx_mbufs[idx] = m;
+
+  regs[E1000_TDT] = (idx + 1) % TX_RING_SIZE;
+
+  release(&tx_lock);
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver an mbuf for each packet (using net_rx()).
-  //
+  while(1){
+    acquire(&rx_lock);
+
+    uint32 idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+
+    // DD 位没有置位，说明没有新的接收包。
+    if((rx_ring[idx].status & E1000_RXD_STAT_DD) == 0){
+      release(&rx_lock);
+      break;
+    }
+
+    struct mbuf *m = rx_mbufs[idx];
+    m->len = rx_ring[idx].length;
+
+    // 给网卡补一个新的 mbuf，供下次 DMA 接收使用。
+    struct mbuf *new_m = mbufalloc(0);
+    if(new_m == 0){
+      release(&rx_lock);
+      break;
+    }
+
+    rx_mbufs[idx] = new_m;
+    rx_ring[idx].addr = (uint64)new_m->head;
+    rx_ring[idx].status = 0;
+
+    // 告诉网卡：这个描述符已经处理完了。
+    regs[E1000_RDT] = idx;
+
+    release(&rx_lock);
+
+    // 不能拿着 rx_lock 调 net_rx，避免网络栈回调发送时死锁。
+    net_rx(m);
+  }
 }
+
 
 void
 e1000_intr(void)

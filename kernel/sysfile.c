@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "riscv.h"
+#include "memlayout.h"
 #include "defs.h"
 #include "param.h"
 #include "stat.h"
@@ -282,6 +283,236 @@ create(char *path, short type, short major, short minor)
 
   return ip;
 }
+
+
+static int
+vmaoverlap(uint64 a1, uint64 l1, uint64 a2, uint64 l2)
+{
+  return a1 < a2 + l2 && a2 < a1 + l1;
+}
+
+static struct vma*
+findvma(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used &&
+       va >= p->vmas[i].addr &&
+       va < p->vmas[i].addr + p->vmas[i].length)
+      return &p->vmas[i];
+  }
+  return 0;
+}
+
+int
+mmapfault(uint64 va, uint64 scause)
+{
+  struct proc *p = myproc();
+  struct vma *v;
+  char *mem;
+  uint64 offset;
+  int perm = PTE_U;
+
+  va = PGROUNDDOWN(va);
+  v = findvma(p, va);
+  if(v == 0)
+    return -1;
+
+  if(scause == 15 && (v->prot & PROT_WRITE) == 0)
+    return -1;
+  if(scause == 13 && (v->prot & PROT_READ) == 0)
+    return -1;
+
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_W;
+  if(v->prot & PROT_EXEC)
+    perm |= PTE_X;
+
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+
+  offset = v->offset + (va - v->addr);
+  ilock(v->file->ip);
+  readi(v->file->ip, 0, (uint64)mem, offset, PGSIZE);
+  iunlock(v->file->ip);
+
+  if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) != 0){
+    kfree(mem);
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+vmawriteback(struct proc *p, struct vma *v, uint64 addr, uint64 len)
+{
+  uint64 a;
+  uint64 pa;
+  uint64 n;
+  uint64 end = addr + len;
+  uint64 vend = v->addr + v->length;
+
+  if((v->flags & MAP_SHARED) == 0)
+    return 0;
+  if((v->prot & PROT_WRITE) == 0)
+    return 0;
+
+  for(a = addr; a < end; a += PGSIZE){
+    pa = walkaddr(p->pagetable, a);
+    if(pa == 0)
+      continue;
+
+    n = PGSIZE;
+    if(a + n > vend)
+      n = vend - a;
+
+    begin_op();
+    ilock(v->file->ip);
+    writei(v->file->ip, 0, pa, v->offset + (a - v->addr), n);
+    iunlock(v->file->ip);
+    end_op();
+  }
+
+  return 0;
+}
+
+int
+domunmap(uint64 addr, uint64 length)
+{
+  struct proc *p = myproc();
+  struct vma *v = 0;
+  uint64 len;
+  uint64 end;
+
+  if(length == 0)
+    return -1;
+
+  addr = PGROUNDDOWN(addr);
+  len = PGROUNDUP(length);
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used &&
+       addr >= p->vmas[i].addr &&
+       addr < p->vmas[i].addr + p->vmas[i].length){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+
+  if(v == 0)
+    return -1;
+
+  if(addr + len > v->addr + v->length)
+    len = v->addr + v->length - addr;
+
+  end = addr + len;
+
+  // 只处理从头部或尾部解除映射；MIT 这个实验允许不用处理中间挖洞。
+  if(addr != v->addr && end != v->addr + v->length)
+    return -1;
+
+  vmawriteback(p, v, addr, len);
+  uvmunmap(p->pagetable, addr, len / PGSIZE, 1);
+
+  if(addr == v->addr && len == v->length){
+    fileclose(v->file);
+    memset(v, 0, sizeof(*v));
+  } else if(addr == v->addr){
+    v->addr += len;
+    v->offset += len;
+    v->length -= len;
+  } else {
+    v->length -= len;
+  }
+
+  return 0;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+
+  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0)
+    return -1;
+
+  return domunmap(addr, length);
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 addrarg;
+  int length, prot, flags, fd, offset;
+  struct file *f;
+  struct proc *p = myproc();
+  struct vma *v = 0;
+  uint64 len;
+  uint64 addr = 0;
+  int ok;
+
+  if(argaddr(0, &addrarg) < 0 ||
+     argint(1, &length) < 0 ||
+     argint(2, &prot) < 0 ||
+     argint(3, &flags) < 0 ||
+     argfd(4, &fd, &f) < 0 ||
+     argint(5, &offset) < 0)
+    return -1;
+
+  if(addrarg != 0 || length <= 0 || offset != 0)
+    return -1;
+
+  if(flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return -1;
+
+  if((prot & PROT_WRITE) && flags == MAP_SHARED && f->writable == 0)
+    return -1;
+
+  len = PGROUNDUP(length);
+  if(len == 0 || len >= TRAPFRAME)
+    return -1;
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used == 0){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(v == 0)
+    return -1;
+
+  for(addr = TRAPFRAME - len; addr > p->sz + PGSIZE; addr -= PGSIZE){
+    ok = 1;
+    for(int i = 0; i < NVMA; i++){
+      if(p->vmas[i].used && vmaoverlap(addr, len, p->vmas[i].addr, p->vmas[i].length)){
+        ok = 0;
+        break;
+      }
+    }
+    if(ok)
+      break;
+  }
+
+  if(addr <= p->sz + PGSIZE)
+    return -1;
+
+  v->used = 1;
+  v->addr = addr;
+  v->length = len;
+  v->prot = prot;
+  v->flags = flags;
+  v->file = f;
+  v->offset = offset;
+  filedup(f);
+
+  return addr;
+}
+
 
 uint64
 sys_open(void)

@@ -294,6 +294,12 @@ fork(void)
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
+
+  for(i = 0; i < NVMA; i++){
+    np->vmas[i] = p->vmas[i];
+    if(np->vmas[i].used)
+      filedup(np->vmas[i].file);
+  }
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
@@ -343,6 +349,11 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used)
+      domunmap(p->vmas[i].addr, p->vmas[i].length);
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
